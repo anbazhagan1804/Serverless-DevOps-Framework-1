@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless DevOps Framework with Canary Deployments and Feature Flags
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 256
+    Runtime: nodejs18.x
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        STAGE: !Ref AWS::StackName
+        POWERTOOLS_SERVICE_NAME: serverless-devops
+        POWERTOOLS_METRICS_NAMESPACE: ServerlessDevOps
+        LOG_LEVEL: INFO
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+
+  CanaryPercentage:
+    Type: Number
+    Default: 10
+    MinValue: 0
+    MaxValue: 100
+    Description: Percentage of traffic to route to canary deployment
+
+  FeatureFlagsTableName:
+    Type: String
+    Default: FeatureFlags
+    Description: DynamoDB table name for feature flags
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # API Gateway
+  ApiGatewayApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Environment
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+      TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayAccessLogs.Arn
+        Format: '{ "requestId":"$context.requestId", "ip": "$context.identity.sourceIp", "caller":"$context.identity.caller", "user":"$context.identity.user","requestTime":"$context.requestTime", "httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath", "status":"$context.status","protocol":"$context.protocol", "responseLength":"$context.responseLength" }'
+
+  # CloudWatch Log Group for API Gateway
+  ApiGatewayAccessLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${AWS::StackName}-${Environment}'
+      RetentionInDays: 30
+
+  # Feature Flags DynamoDB Table
+  FeatureFlagsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref FeatureFlagsTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: featureKey
+          AttributeType: S
+        - AttributeName: environment
+          AttributeType: S
+      KeySchema:
+        - AttributeName: featureKey
+          KeyType: HASH
+        - AttributeName: environment
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # Lambda Function for Feature Flag Management
+  FeatureFlagFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/functions/feature-flags/
+      Handler: index.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FeatureFlagsTable
+        - CloudWatchLogsFullAccess
+      Events:
+        GetFeatureFlag:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGatewayApi
+            Path: /feature-flags/{featureKey}
+            Method: GET
+        UpdateFeatureFlag:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGatewayApi
+            Path: /feature-flags/{featureKey}
+            Method: PUT
+      Environment:
+        Variables:
+          FEATURE_FLAGS_TABLE: !Ref FeatureFlagsTable
+
+  # Example Lambda Function with Canary Deployment
+  ExampleFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/functions/example/
+      Handler: index.handler
+      AutoPublishAlias: live
+      DeploymentPreference:
+        Type: Canary10Percent5Minutes
+        Alias: !Ref ExampleFunctionAlias
+        DeploymentPreference:
+          Type: Canary10Percent5Minutes
+          Alias: !Ref ExampleFunctionAlias
+          Hooks:
+            PreTrafficHook: !Ref PreTrafficHookFunction
+            PostTrafficHook: !Ref PostTrafficHookFunction
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGatewayApi
+            Path: /example
+            Method: GET
+
+  # Canary Deployment Hooks
+  PreTrafficHookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/functions/canary-hooks/
+      Handler: pre-traffic.handler
+      Runtime: nodejs18.x
+      Timeout: 300
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+
+  PostTrafficHookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/functions/canary-hooks/
+      Handler: post-traffic.handler
+      Runtime: nodejs18.x
+      Timeout: 300
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+
+  # Lambda Alias for Canary Deployments
+  ExampleFunctionAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref ExampleFunction
+      FunctionVersion: !GetAtt ExampleFunction.Version
+      Name: !Ref Environment
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ApiGatewayApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/"
+  
+  FeatureFlagsTableName:
+    Description: DynamoDB table for feature flags
+    Value: !Ref FeatureFlagsTable
+
+  ExampleFunctionArn:
+    Description: Example Function ARN
+    Value: !GetAtt ExampleFunction.Arn
+
+  ExampleFunctionAliasArn:
+    Description: Example Function Alias ARN
+    Value: !Ref ExampleFunctionAlias 
