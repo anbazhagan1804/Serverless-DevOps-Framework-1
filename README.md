@@ -47,7 +47,7 @@ A modern serverless application framework implementing Infrastructure as Code (I
 
 1. **Clone the repository**
    ```bash
-   git clone [repository-url]
+   git clone [https://github.com/anbazhagan1804/Serverless-DevOps-Framework-1]
    cd serverless-devops-framework
    ```
 
